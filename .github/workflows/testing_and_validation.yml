@@ -69,6 +69,9 @@ jobs:
 
       - name: Prepare compatible build tooling
         run: |
+          python -m venv "$GITHUB_WORKSPACE/.venv"
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
           # DMOD uses the pre-14 websockets API and imports pkg_resources.
           # Keep these compatibility constraints in CI, without editing manifests.
           cat > "$RUNNER_TEMP/dmod-ci-constraints.txt" <<'EOF'
@@ -104,12 +107,12 @@ jobs:
           openssl x509 -in "$TEST_SSL_CERT_DIR/certificate.pem" -noout -checkend 0
 
       - name: Run library and service unit tests
-        # pytest.ini supplies namespace import handling and excludes Django apps.
+        # The documented helper isolates test files in separate interpreters.
+        # This preserves importable multiprocessing classes and event-loop isolation.
         # Integration tests (it_*.py) remain in integration_tests.yml.
         run: |
-          python -m pytest python/lib python/services -vv -o python_files='test_*.py' \
-            -o faulthandler_timeout=60 --durations=20 \
-            --junitxml="$RUNNER_TEMP/dmod-test-results/unit.xml"
+          bash scripts/run_tests.sh --venv "$GITHUB_WORKSPACE/.venv" --service-packages -vv \
+            2>&1 | tee "$RUNNER_TEMP/dmod-test-results/unit.log"
         timeout-minutes: 15
 
       - name: Run evaluation service Django tests
