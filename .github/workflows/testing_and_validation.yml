@@ -1,116 +1,130 @@
-# Test changes that have been pushed to the master and dev branches
-
 name: Testing and Validation
 
-# Controls when the action will run.
 on:
   push:
-    branches: [ master, dev ]
+    branches: [master, dev]
   pull_request:
-    branches: [ master, dev ]
+    branches: [master, dev]
+  workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
+concurrency:
+  group: testing-and-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # Run unit tests on Python
-  test_unit_ubuntu_latest:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11']
+  test:
+    name: Python 3.12 tests and dependency validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROJECT_ROOT: ${{ github.workspace }}
+      TEST_SSL_CERT_DIR: ${{ runner.temp }}/dmod-ssl/local
+      DMOD_TEST_SSL_CERT_DIR: ${{ runner.temp }}/dmod-ssl/local
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      TZ: UTC
+      MAAS_TIMEZONE: UTC
+      SQL_ENGINE: django.db.backends.sqlite3
+      SQL_DATABASE: ${{ runner.temp }}/dmod-tests.sqlite3
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      CHANNEL_HOST: localhost
+      CHANNEL_PORT: "6379"
+    services:
+      # CI-only database, without production credentials or repository secrets.
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          # Matches the root pyproject.toml minimum; older CI versions no longer do.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+            python/**/pyproject.toml
+            .github/workflows/testing_and_validation.yaml
 
-      - name: Cache Python Venv
-        id: cache-python-venv
-        uses: actions/cache@v4
-        with:
-          path: dmod_venv
-          key: dmod-venv-dir-${{ hashFiles('python/**/_version.py', '**/requirements*.txt') }}
-
-      - name: Init Python Venv
-        if: steps.cache-python-venv.outputs.cache-hit != 'true'
+      - name: Prepare compatible build tooling
         run: |
-          python3 -m venv dmod_venv
-          . dmod_venv/bin/activate
-          pip install --upgrade pip
-          deactivate
-          ./scripts/update_package.sh --venv dmod_venv --dependencies
+          # DMOD uses the pre-14 websockets API and imports pkg_resources.
+          # Keep these compatibility constraints in CI, without editing manifests.
+          cat > "$RUNNER_TEMP/dmod-ci-constraints.txt" <<'EOF'
+          websockets>=10.1,<14
+          setuptools>=80.9,<81
+          EOF
+          echo "PIP_CONSTRAINT=$RUNNER_TEMP/dmod-ci-constraints.txt" >> "$GITHUB_ENV"
+          echo "PIP_BUILD_CONSTRAINT=$RUNNER_TEMP/dmod-ci-constraints.txt" >> "$GITHUB_ENV"
+          python -m pip install --upgrade 'pip>=25.3' 'setuptools>=80.9,<81' wheel
 
-      - name: Cache Package Checksums
-        id: cache-packages-md5
-        uses: actions/cache@v4
-        with:
-          path: package_md5s
-          key: package_md5s-${{ hashFiles('python/**/*') }}
-
-      - name: Update Individual Packages
-        id: update-individual-packages
+      - name: Install dependencies and all local packages
         run: |
-          [ ! -d package_md5s ] && mkdir package_md5s
-          set -e
-          for p in `./scripts/run_tests.sh --list-packages --service-packages --quiet`; do
-            _P_SIMPLE_NAME="`basename ${p}`"
-            _P_MD5_FILE="package_md5s/${_P_SIMPLE_NAME}.md5"
-            _P_EXPECTED_MD5="`find ${p} -type f -exec md5sum {} \; | sort -k 2 | md5sum`"
-            if [ -e ${p}/pyproject.toml ]; then
-              if [ '${{ steps.cache-python-venv.outputs.cache-hit }}' = 'true' ]; then
-                if [ -e ${_P_MD5_FILE} ]; then
-                  if [ "`cat ${_P_MD5_FILE}`" = "${_P_EXPECTED_MD5}" ]; then
-                    echo "Package checksum file '${_P_MD5_FILE}' matches expected"
-                  else
-                    echo "Package checksum file '${_P_MD5_FILE}' contents do not match; updating"
-                    ./scripts/update_package.sh --venv dmod_venv ${p}
-                  fi
-                else
-                  echo "Creating package checksum file '${_P_MD5_FILE}'"
-                  echo "${_P_EXPECTED_MD5}" > ${_P_MD5_FILE}
-                fi
-              else
-                echo "Creating package checksum file '${_P_MD5_FILE}'"
-                echo "${_P_EXPECTED_MD5}" > ${_P_MD5_FILE}
-              fi
-            fi
+          # One resolver transaction ensures dmod.* comes from this checkout,
+          # including packages omitted by the old test-directory-based installer.
+          packages=()
+          for manifest in python/lib/*/pyproject.toml python/services/*/pyproject.toml; do
+            packages+=("./${manifest%/pyproject.toml}[test]")
           done
-          set +e
+          python -m pip install -r requirements.txt "${packages[@]}"
 
-      - name: Cache SSL Setup
-        id: cache-ssl-setup
-        uses: actions/cache@v4
+      - name: Validate installed dependencies
+        id: dependencies
+        run: |
+          python -m pip check
+          mkdir -p "$RUNNER_TEMP/dmod-test-results"
+          python -m pip freeze > "$RUNNER_TEMP/dmod-test-results/dependencies.txt"
+
+      - name: Generate test SSL certificates
+        id: certificates
+        run: |
+          mkdir -p "$TEST_SSL_CERT_DIR"
+          bash scripts/gen_cert.sh -d "$TEST_SSL_CERT_DIR" -host localhost -email dmod-ci@example.invalid
+          openssl x509 -in "$TEST_SSL_CERT_DIR/certificate.pem" -noout -checkend 0
+
+      - name: Run library and service unit tests
+        # pytest.ini supplies namespace import handling and excludes Django apps.
+        # Integration tests (it_*.py) remain in integration_tests.yml.
+        run: |
+          python -m pytest python/lib python/services -o python_files='test_*.py' \
+            --junitxml="$RUNNER_TEMP/dmod-test-results/unit.xml"
+        timeout-minutes: 15
+
+      - name: Run evaluation service Django tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.certificates.outcome == 'success' }}
+        working-directory: python/services/evaluationservice/dmod/evaluationservice
+        run: python manage.py test --noinput --verbosity 2
+        timeout-minutes: 10
+
+      - name: Run GUI Django tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.certificates.outcome == 'success' }}
+        working-directory: python/gui
+        run: python manage.py test --noinput --verbosity 2
+        timeout-minutes: 10
+
+      - name: Upload test results and dependency versions
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         with:
-          path: ssl
-          key: dmod-ssl-setup
-
-      # Set up the SSL directory
-      - name: Setup SSL
-        if: steps.cache-ssl-setup.outputs.cache-hit != 'true'
-        run: |
-          mkdir ssl
-          mkdir ssl/local
-          mkdir ssl/requestservice
-          mkdir ssl/requests
-          mkdir ssl/scheduler
-          ./scripts/gen_cert.sh -d ssl/local -email dmod_gh_action@fake.gov
-          cp -a ssl/local/*.pem ssl/requestservice/.
-          cp -a ssl/local/*.pem ssl/requests/.
-          cp -a ssl/local/*.pem ssl/scheduler/.
-
-      - name: Echo dependency versions
-        run: |
-          . dmod_venv/bin/activate
-          python3 -m pip freeze
-          deactivate
-        timeout-minutes: 1
-
-      - name: Run Tests
-        run: ./scripts/run_tests.sh --venv dmod_venv -v -d -srv
-        timeout-minutes: 1
+          name: testing-and-validation-python-3.12
+          path: ${{ runner.temp }}/dmod-test-results/
+          if-no-files-found: ignore
+          retention-days: 7
