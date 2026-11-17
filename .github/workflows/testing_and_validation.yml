@@ -107,7 +107,8 @@ jobs:
         # pytest.ini supplies namespace import handling and excludes Django apps.
         # Integration tests (it_*.py) remain in integration_tests.yml.
         run: |
-          python -m pytest python/lib python/services -o python_files='test_*.py' \
+          python -m pytest python/lib python/services -vv -o python_files='test_*.py' \
+            -o faulthandler_timeout=60 --durations=20 \
             --junitxml="$RUNNER_TEMP/dmod-test-results/unit.xml"
         timeout-minutes: 15
 
