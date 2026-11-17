@@ -77,6 +77,8 @@ jobs:
           cat > "$RUNNER_TEMP/dmod-ci-constraints.txt" <<'EOF'
           websockets>=10.1,<14
           setuptools>=80.9,<81
+          # Existing CSV readers use date_parser; metrics expect nanosecond dates.
+          pandas>=2.3,<3
           EOF
           echo "PIP_CONSTRAINT=$RUNNER_TEMP/dmod-ci-constraints.txt" >> "$GITHUB_ENV"
           echo "PIP_BUILD_CONSTRAINT=$RUNNER_TEMP/dmod-ci-constraints.txt" >> "$GITHUB_ENV"
@@ -107,12 +109,31 @@ jobs:
           openssl x509 -in "$TEST_SSL_CERT_DIR/certificate.pem" -noout -checkend 0
 
       - name: Run library and service unit tests
-        # The documented helper isolates test files in separate interpreters.
+        # The documented helper isolates packages in separate interpreters.
         # This preserves importable multiprocessing classes and event-loop isolation.
         # Integration tests (it_*.py) remain in integration_tests.yml.
         run: |
-          bash scripts/run_tests.sh --venv "$GITHUB_WORKSPACE/.venv" --service-packages -vv \
-            2>&1 | tee "$RUNNER_TEMP/dmod-test-results/unit.log"
+          run_unit_tests() {
+            local failed=0 package result
+            for package in python/lib/* python/services/*; do
+              [[ -d "$package/dmod/test" ]] || continue
+              echo "Testing $package"
+              if bash scripts/test_package.sh --venv "$GITHUB_WORKSPACE/.venv" -v "$package"; then
+                echo "Passed: $package"
+              else
+                result=$?
+                if [[ "$result" -eq 5 ]]; then
+                  # Python 3.12 unittest uses exit 5 for a suite with zero tests.
+                  echo "No unit tests defined: $package"
+                else
+                  echo "Failed: $package (exit $result)"
+                  failed=1
+                fi
+              fi
+            done
+            return "$failed"
+          }
+          run_unit_tests 2>&1 | tee "$RUNNER_TEMP/dmod-test-results/unit.log"
         timeout-minutes: 15
 
       - name: Run evaluation service Django tests
