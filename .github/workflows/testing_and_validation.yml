@@ -24,14 +24,11 @@ jobs:
         shell: bash
     env:
       PROJECT_ROOT: ${{ github.workspace }}
-      TEST_SSL_CERT_DIR: ${{ runner.temp }}/dmod-ssl/local
-      DMOD_TEST_SSL_CERT_DIR: ${{ runner.temp }}/dmod-ssl/local
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"
       TZ: UTC
       MAAS_TIMEZONE: UTC
       SQL_ENGINE: django.db.backends.sqlite3
-      SQL_DATABASE: ${{ runner.temp }}/dmod-tests.sqlite3
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
       CHANNEL_HOST: localhost
@@ -49,6 +46,12 @@ jobs:
           --health-retries 5
 
     steps:
+      - name: Initialize runner paths
+        run: |
+          echo "TEST_SSL_CERT_DIR=$RUNNER_TEMP/dmod-ssl/local" >> "$GITHUB_ENV"
+          echo "DMOD_TEST_SSL_CERT_DIR=$RUNNER_TEMP/dmod-ssl/local" >> "$GITHUB_ENV"
+          echo "SQL_DATABASE=$RUNNER_TEMP/dmod-tests.sqlite3" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@v6
 
@@ -62,7 +65,7 @@ jobs:
             requirements.txt
             pyproject.toml
             python/**/pyproject.toml
-            .github/workflows/testing_and_validation.yaml
+            .github/workflows/testing_and_validation.y*ml
 
       - name: Prepare compatible build tooling
         run: |
